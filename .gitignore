@@ -1,0 +1,7 @@
+build/
+data/
+CLAUDE.md
+.claude/
+*.swp
+*.swo
+compile_commands.json
