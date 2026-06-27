@@ -1,6 +1,7 @@
 #include "sse_client.hpp"
 #include "event_parser.hpp"
 #include <curl/curl.h>
+#include <cstdio>
 #include <string_view>
 
 SSEClient::SSEClient(std::string url, EventCallback cb)
@@ -13,6 +14,9 @@ bool SSEClient::run() {
     curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     headers = curl_slist_append(headers, "Cache-Control: no-cache");
+    // Wikimedia policy requires a descriptive User-Agent (https://w.wiki/4wJS).
+    headers = curl_slist_append(headers,
+        "User-Agent: rt-wiki-pipeline/0.1 (portfolio project; github.com) libcurl");
 
     curl_easy_setopt(curl, CURLOPT_URL,            url_.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     headers);
@@ -21,7 +25,21 @@ bool SSEClient::run() {
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE,  1L);
 
+    // Use the Windows native certificate store when available.
+    // Without this, MSYS2 curl fails SSL verification on wikimedia.org.
+#ifdef CURLSSLOPT_NATIVE_CA
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
+
     CURLcode res = curl_easy_perform(curl);
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    std::fprintf(stderr, "curl finished: HTTP %ld  code=%s\n",
+                 http_code, curl_easy_strerror(res));
+    if (!buffer_.empty())
+        std::fprintf(stderr, "unprocessed buffer (%zu bytes): %.300s\n",
+                     buffer_.size(), buffer_.c_str());
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
