@@ -12,7 +12,19 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
   GIT_TAG        v3.6.0
 )
-FetchContent_MakeAvailable(Catch2)
+
+# Header-only JSON library — used for SSE event parsing.
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3
+)
+
+FetchContent_MakeAvailable(Catch2 nlohmann_json)
+
+# libcurl must be installed on the host (e.g. via vcpkg, apt, or brew).
+# On Windows with vcpkg: vcpkg install curl
+find_package(CURL REQUIRED)
 
 enable_testing()
 
