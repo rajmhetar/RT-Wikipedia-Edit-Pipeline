@@ -1,3 +1,5 @@
+#include "event_source.hpp"
+#include "replay_source.hpp"
 #include "sse_client.hpp"
 #include "spsc_ring_buffer.hpp"
 
@@ -10,7 +12,9 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -39,23 +43,20 @@ struct Shard {
 // Global so the signal handler can reach them without a captured pointer.
 static std::array<Shard, kNumShards>    g_shards;
 static std::atomic<bool>                g_running{true};
-static std::atomic<SSEClient*>          g_sse_client{nullptr};  // for Ctrl+C
+static std::atomic<EventSource*>        g_source{nullptr};  // for Ctrl+C
 
 // ---------------------------------------------------------------------------
-// Signal handler — sets the stop flag and aborts the SSE connection so that
-// both the producer and all consumers unwind cleanly.
-// Note: std::atomic load/store are lock-free on all mainstream platforms and
-// safe to call from a signal handler in practice, though not POSIX-guaranteed.
+// Signal handler — sets the stop flag and aborts the source so that both the
+// producer and all consumers unwind cleanly.
 // ---------------------------------------------------------------------------
 static void on_signal(int) {
     g_running.store(false, std::memory_order_relaxed);
-    SSEClient* c = g_sse_client.load(std::memory_order_relaxed);
-    if (c) c->stop();
+    EventSource* src = g_source.load(std::memory_order_relaxed);
+    if (src) src->stop();
 }
 
 // ---------------------------------------------------------------------------
 // Route an event to a shard by hashing the page title.
-// Using & (N-1) instead of % N because kNumShards is a power of two.
 // ---------------------------------------------------------------------------
 static int shard_for(const char* title) {
     std::size_t h = std::hash<std::string_view>{}(std::string_view{title});
@@ -93,35 +94,66 @@ static void print_shard_stats(int id,
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-int main() {
+int main(int argc, char** argv) {
+    // --- Argument parsing --------------------------------------------------
+    std::string record_path;
+    std::string replay_path;
+    double      replay_speed = 1.0;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a{argv[i]};
+        if      (a == "--record" && i + 1 < argc) record_path  = argv[++i];
+        else if (a == "--replay" && i + 1 < argc) replay_path  = argv[++i];
+        else if (a == "--speed"  && i + 1 < argc) replay_speed = std::stod(argv[++i]);
+        else {
+            std::cerr << "Usage: " << argv[0]
+                      << " [--record <file>] [--replay <file> [--speed <N>]]\n";
+            return 1;
+        }
+    }
+
     std::signal(SIGINT, on_signal);
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    // --- Build the event source --------------------------------------------
+    std::unique_ptr<EventSource> source;
+    if (!replay_path.empty()) {
+        source = std::make_unique<ReplaySource>(replay_path, replay_speed);
+        std::cerr << "Replaying '" << replay_path << "' at "
+                  << (replay_speed == ReplaySource::kNoDelay
+                          ? "max speed"
+                          : std::to_string(replay_speed) + "x")
+                  << '\n';
+    } else {
+        std::optional<std::string> rec =
+            record_path.empty() ? std::nullopt
+                                : std::optional<std::string>{record_path};
+        source = std::make_unique<SSEClient>(
+            "https://stream.wikimedia.org/v2/stream/recentchange", rec);
+        if (rec)
+            std::cerr << "Connecting and recording to '" << record_path << "'...\n";
+        else
+            std::cerr << "Connecting...\n";
+    }
+
     // --- Producer thread ---------------------------------------------------
-    // Owns the SSE connection. For each event, hashes the title to pick a
+    // Owns the event source. For each event, hashes the title to pick a
     // shard and pushes into that shard's queue.  Drop-on-full: never block
     // the network thread — it would stall the HTTP receive buffer.
-    std::thread producer([] {
-        SSEClient client{
-            "https://stream.wikimedia.org/v2/stream/recentchange",
-            [](const WikiEvent& ev) {
-                int s = shard_for(ev.title);
-                if (!g_shards[s].queue.push(ev))
-                    g_shards[s].dropped.fetch_add(1, std::memory_order_relaxed);
-            }
-        };
-        g_sse_client.store(&client, std::memory_order_relaxed);
-        std::cerr << "Connecting...\n";
-        client.run();
-        std::cerr << "Connection closed.\n";
-        g_sse_client.store(nullptr, std::memory_order_relaxed);
+    std::thread producer([&source] {
+        g_source.store(source.get(), std::memory_order_relaxed);
+        source->run([](const WikiEvent& ev) {
+            int s = shard_for(ev.title);
+            if (!g_shards[s].queue.push(ev))
+                g_shards[s].dropped.fetch_add(1, std::memory_order_relaxed);
+        });
+        std::cerr << "Source finished.\n";
+        g_source.store(nullptr, std::memory_order_relaxed);
         g_running.store(false, std::memory_order_release);
     });
 
     // --- N consumer threads -----------------------------------------------
-    // Each consumer owns its shard's state exclusively.
-    // No locks on edit_counts: only this thread touches it.
-    std::array<uint64_t, kNumShards> shard_totals{};  // written before join
+    std::array<uint64_t, kNumShards> shard_totals{};
 
     std::array<std::thread, kNumShards> consumers;
     for (int i = 0; i < kNumShards; ++i) {
@@ -135,17 +167,16 @@ int main() {
 
             WikiEvent ev{};
 
-            // acquire: when we see g_running==false we're guaranteed to also
-            // see all pushes the producer made before its release store.
             while (g_running.load(std::memory_order_acquire)) {
                 if (shard.queue.pop(ev)) {
                     edit_counts[ev.title]++;
                     ++total;
 
-                    if (Clock::now() >= next_report) {
+                    auto now = Clock::now();
+                    if (now >= next_report) {
                         print_shard_stats(i, edit_counts, total,
                                           shard.dropped.load(std::memory_order_relaxed));
-                        next_report = Clock::now() + std::chrono::seconds(10);
+                        next_report = now + std::chrono::seconds(10);
                     }
                 } else {
                     std::this_thread::yield();
@@ -158,7 +189,7 @@ int main() {
                 ++total;
             }
 
-            shard_totals[i] = total;  // safe: main reads this only after join
+            shard_totals[i] = total;
             print_shard_stats(i, edit_counts, total,
                               shard.dropped.load(std::memory_order_relaxed));
         });

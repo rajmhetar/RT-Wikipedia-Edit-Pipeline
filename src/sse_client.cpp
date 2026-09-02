@@ -1,17 +1,32 @@
 #include "sse_client.hpp"
 #include "event_parser.hpp"
 #include <curl/curl.h>
+#include <chrono>
 #include <cstdio>
 #include <string_view>
 
-SSEClient::SSEClient(std::string url, EventCallback cb)
-    : url_(std::move(url)), cb_(std::move(cb)) {}
+SSEClient::SSEClient(std::string url, std::optional<std::string> record_path)
+    : url_(std::move(url)), record_path_(std::move(record_path)) {}
 
 void SSEClient::stop() noexcept {
     stop_.store(true, std::memory_order_relaxed);
 }
 
-bool SSEClient::run() {
+bool SSEClient::run(EventCallback cb) {
+    cb_ = std::move(cb);
+    stop_.store(false, std::memory_order_relaxed);
+
+    if (record_path_) {
+        record_file_.emplace(*record_path_);
+        if (!record_file_->is_open()) {
+            std::fprintf(stderr, "record: cannot open '%s' for writing\n",
+                         record_path_->c_str());
+            return false;
+        }
+        *record_file_ << "# rt-wiki-pipeline capture v1\n"
+                       << "# format: <unix_timestamp_us>\\t<json_payload>\\n\n";
+    }
+
     CURL* curl = curl_easy_init();
     if (!curl) return false;
 
@@ -47,6 +62,7 @@ bool SSEClient::run() {
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+    record_file_.reset();
     return res == CURLE_OK || intentional;
 }
 
@@ -79,9 +95,17 @@ void SSEClient::process_buffer() {
                 if (!payload.empty() && payload.front() == ' ')
                     payload.remove_prefix(1);
 
-                WikiEvent ev{};
-                if (!payload.empty() && parse_wiki_event(payload, ev))
-                    cb_(ev);
+                if (!payload.empty()) {
+                    if (record_file_) {
+                        using namespace std::chrono;
+                        auto ts = duration_cast<microseconds>(
+                            system_clock::now().time_since_epoch()).count();
+                        (*record_file_) << ts << '\t' << payload << '\n';
+                    }
+                    WikiEvent ev{};
+                    if (parse_wiki_event(payload, ev))
+                        cb_(ev);
+                }
                 break;
             }
             line_start = line_end + 1;

@@ -1,6 +1,7 @@
 add_executable(wiki_tests
     test_ring_buffer.cpp
     test_sse_parser.cpp
+    test_capture_replay.cpp
 )
 target_compile_features(wiki_tests PRIVATE cxx_std_20)
 target_enable_warnings(wiki_tests)
@@ -11,4 +12,6 @@ target_link_libraries(wiki_tests PRIVATE
 )
 
 include(Catch)
-catch_discover_tests(wiki_tests)
+# DISCOVERY_MODE PRE_TEST defers test discovery to ctest-run time rather than
+# cmake build time, which avoids DLL-path failures on Windows/MinGW builds.
+catch_discover_tests(wiki_tests DISCOVERY_MODE PRE_TEST)
