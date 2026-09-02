@@ -1,3 +1,4 @@
+#include "edit_storm_detector.hpp"
 #include "event_source.hpp"
 #include "replay_source.hpp"
 #include "sse_client.hpp"
@@ -160,10 +161,12 @@ int main(int argc, char** argv) {
         consumers[i] = std::thread([i, &shard_totals] {
             auto& shard = g_shards[i];
             std::unordered_map<std::string, uint64_t> edit_counts;
+            EditStormDetector storm;
             uint64_t total = 0;
 
             using Clock = std::chrono::steady_clock;
             auto next_report = Clock::now() + std::chrono::seconds(10);
+            auto next_evict  = Clock::now() + std::chrono::seconds(60);
 
             WikiEvent ev{};
 
@@ -172,11 +175,30 @@ int main(int argc, char** argv) {
                     edit_counts[ev.title]++;
                     ++total;
 
+                    if (ev.timestamp > 0) {
+                        if (auto alert = storm.update(ev, ev.timestamp)) {
+                            std::lock_guard lock{g_print_mtx};
+                            std::cout
+                                << "** STORM shard=" << i
+                                << " \"" << alert->page << "\""
+                                << " edits=" << alert->window_count
+                                << " rate="  << std::fixed << std::setprecision(1)
+                                << alert->window_rate   * 60.0 << "/min"
+                                << " base="
+                                << alert->baseline_rate * 60.0 << "/min\n";
+                            std::cout.flush();
+                        }
+                    }
+
                     auto now = Clock::now();
                     if (now >= next_report) {
                         print_shard_stats(i, edit_counts, total,
                                           shard.dropped.load(std::memory_order_relaxed));
                         next_report = now + std::chrono::seconds(10);
+                    }
+                    if (now >= next_evict) {
+                        storm.evict_idle(ev.timestamp);
+                        next_evict = now + std::chrono::seconds(60);
                     }
                 } else {
                     std::this_thread::yield();

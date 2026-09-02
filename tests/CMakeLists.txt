@@ -1,6 +1,7 @@
 add_executable(wiki_tests
     test_ring_buffer.cpp
     test_sse_parser.cpp
+    test_detectors.cpp
     test_capture_replay.cpp
 )
 target_compile_features(wiki_tests PRIVATE cxx_std_20)
