@@ -1,7 +1,19 @@
 build/
+build-release/
 data/
 CLAUDE.md
 .claude/
 *.swp
 *.swo
 compile_commands.json
+
+# LaTeX paper (source + build artifacts)
+paper/
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
